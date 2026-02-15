@@ -240,26 +240,6 @@ if uploaded_file:
     fx_rate = fetch_fx_rate()
 
     # =============================
-    # リスク指標サマリー
-    # =============================
-    st.markdown("##### リスク指標")
-    risk_col1, risk_col2, risk_col3, risk_col4 = st.columns(4)
-    with risk_col1:
-        st.metric("ポートフォリオβ値", f"{portfolio_beta:.2f}",
-                  help="1.0 = 市場(S&P500)と同じリスク。1超は市場より高リスク")
-    with risk_col2:
-        st.metric("年率ボラティリティ", f"{portfolio_annual_vol * 100:.1f}%",
-                  help="ポートフォリオ全体の年率換算変動率（過去6ヶ月）")
-    with risk_col3:
-        st.metric("シャープレシオ", f"{sharpe_ratio:.2f}",
-                  help="リスク調整後リターン。高いほどリスクに対するリターンが効率的")
-    with risk_col4:
-        st.metric("最大ドローダウン", f"{max_drawdown * 100:.1f}%",
-                  help="過去6ヶ月間の最大下落幅")
-
-    st.markdown("---")
-
-    # =============================
     # メイン3カラム
     # =============================
     col1, col2, col3 = st.columns([1, 1, 1])
@@ -416,6 +396,24 @@ if uploaded_file:
                 ax2.invert_yaxis()
                 ax2.axis('off')
                 st.pyplot(fig2, use_container_width=True)
+
+    # =============================
+    # リスク指標サマリー
+    # =============================
+    st.markdown("##### リスク指標")
+    risk_col1, risk_col2, risk_col3, risk_col4 = st.columns(4)
+    with risk_col1:
+        st.metric("ポートフォリオβ値", f"{portfolio_beta:.2f}",
+                  help="1.0 = 市場(S&P500)と同じリスク。1超は市場より高リスク")
+    with risk_col2:
+        st.metric("年率ボラティリティ", f"{portfolio_annual_vol * 100:.1f}%",
+                  help="ポートフォリオ全体の年率換算変動率（過去6ヶ月）")
+    with risk_col3:
+        st.metric("シャープレシオ", f"{sharpe_ratio:.2f}",
+                  help="リスク調整後リターン。高いほどリスクに対するリターンが効率的")
+    with risk_col4:
+        st.metric("最大ドローダウン", f"{max_drawdown * 100:.1f}%",
+                  help="過去6ヶ月間の最大下落幅")
 
     # =============================
     # 銘柄別リスク・バリュエーション指標
