@@ -336,6 +336,13 @@ if uploaded_file:
         else:
             return "#ff6666"
 
+    def text_color_for_bg(hex_color):
+        """背景色の輝度に応じて黒 or 白のテキスト色を返す"""
+        h = hex_color.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        return "black" if luminance > 140 else "white"
+
     display_position = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)].copy()
 
     with col2:
@@ -402,7 +409,7 @@ if uploaded_file:
                     text = f"{lbl}\n{rate * 100:.2f}%"
                     if fs < 5 or dx < 15 or dy < 15:
                         continue
-                    ax2.text(x + dx / 2, y + dy / 2, text, color='white', ha='center', va='center', fontsize=fs)
+                    ax2.text(x + dx / 2, y + dy / 2, text, color=text_color_for_bg(color), ha='center', va='center', fontsize=fs)
 
                 ax2.set_xlim(0, 600)
                 ax2.set_ylim(0, 400)
