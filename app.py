@@ -39,9 +39,19 @@ def fetch_stock_info(ticker):
             "price": data.get("regularMarketPrice"),
             "prev_close": data.get("previousClose"),
             "sector": data.get("sector", "その他"),
+            "per": data.get("trailingPE"),
+            "forward_per": data.get("forwardPE"),
+            "pbr": data.get("priceToBook"),
+            "dividend_yield": data.get("dividendYield"),
+            "eps": data.get("trailingEps"),
+            "market_cap": data.get("marketCap"),
         }
     except Exception:
-        return {"price": None, "prev_close": None, "sector": "その他"}
+        return {
+            "price": None, "prev_close": None, "sector": "その他",
+            "per": None, "forward_per": None, "pbr": None,
+            "dividend_yield": None, "eps": None, "market_cap": None,
+        }
 
 
 @st.cache_data(ttl=300)
@@ -93,19 +103,35 @@ if uploaded_file:
     current_prices = {}
     previous_closes = {}
     sectors = {}
+    pers = {}
+    forward_pers = {}
+    pbrs = {}
+    dividend_yields = {}
+    epss = {}
+    market_caps = {}
     for ticker in tickers:
         info = fetch_stock_info(ticker)
         current_prices[ticker] = info["price"]
         previous_closes[ticker] = info["prev_close"]
         sectors[ticker] = info["sector"]
+        pers[ticker] = info["per"]
+        forward_pers[ticker] = info["forward_per"]
+        pbrs[ticker] = info["pbr"]
+        dividend_yields[ticker] = info["dividend_yield"]
+        epss[ticker] = info["eps"]
+        market_caps[ticker] = info["market_cap"]
 
     position["現在株価"] = position.index.map(current_prices)
     position["前日終値"] = position.index.map(previous_closes)
     position["セクター"] = position.index.map(sectors)
+    position["PER"] = position.index.map(pers)
+    position["予想PER"] = position.index.map(forward_pers)
+    position["PBR"] = position.index.map(pbrs)
+    position["配当利回り"] = position.index.map(dividend_yields)
+    position["EPS"] = position.index.map(epss)
+    position["時価総額"] = position.index.map(market_caps)
     position.dropna(subset=["現在株価", "前日終値"], inplace=True)
     position["評価額"] = position["signed_qty"] * position["現在株価"]
-    position["含み損益"] = position["評価額"] - (position["signed_qty"] * position["平均取得単価"])
-    position["含み損益率"] = (position["現在株価"] - position["平均取得単価"]) / position["平均取得単価"]
     position["騰落率"] = (position["現在株価"] - position["前日終値"]) / position["前日終値"]
 
     # --- リスク指標の計算 ---
@@ -217,21 +243,11 @@ if uploaded_file:
             total_value = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)]["評価額"].sum()
             total_value = total_value + cash_usd + (cash_jpy / fx_rate)
 
-            # 含み損益の合計
-            total_pnl = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)]["含み損益"].sum()
-            total_cost = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)].apply(
-                lambda r: r["signed_qty"] * r["平均取得単価"], axis=1
-            ).sum()
-            total_pnl_rate = (total_pnl / total_cost * 100) if total_cost > 0 else 0
-            pnl_color = "#00ff88" if total_pnl >= 0 else "#ff4444"
-
             if st.session_state.show_yen:
                 fmt_total = f"{total_value * fx_rate:,.0f}"
-                fmt_pnl = f"{total_pnl * fx_rate:+,.0f}"
                 currency_label = "円"
             else:
                 fmt_total = f"{total_value:,.2f}"
-                fmt_pnl = f"{total_pnl:+,.2f}"
                 currency_label = "USD"
 
             st.markdown(f"""
@@ -240,34 +256,24 @@ if uploaded_file:
                 <p style='font-size:32px; font-weight: bold; margin: 0;'>
                     {fmt_total} <span style='font-size:14px;'>{currency_label}</span>
                 </p>
-                <p style='font-size:16px; color: {pnl_color}; margin: 0;'>
-                    含み損益: {fmt_pnl} {currency_label} ({total_pnl_rate:+.2f}%)
-                </p>
             </div><br>
             """, unsafe_allow_html=True)
 
             for ticker in sorted_position.index:
                 is_hidden = ticker in st.session_state.hidden_tickers
                 eval_value = sorted_position.at[ticker, "評価額"] if not is_hidden else 0
-                pnl = sorted_position.at[ticker, "含み損益"] if not is_hidden else 0
-                pnl_rate = sorted_position.at[ticker, "含み損益率"] if not is_hidden else 0
-                ticker_pnl_color = "#00ff88" if pnl >= 0 else "#ff4444"
 
                 if st.session_state.show_yen:
                     eval_display = f"{eval_value * fx_rate:,.0f}"
-                    pnl_display = f"{pnl * fx_rate:+,.0f}"
                 else:
                     eval_display = f"{eval_value:,.2f}"
-                    pnl_display = f"{pnl:+,.2f}"
 
                 percent = (eval_value / total_value * 100) if total_value > 0 else 0
 
                 cols = st.columns([2, 3, 2])
                 cols[0].markdown(f"<span style='font-size:18px;'>{ticker}</span>", unsafe_allow_html=True)
                 cols[1].markdown(
-                    f"<span style='font-size:16px;'>{eval_display} ({percent:.1f}%)</span><br>"
-                    f"<span style='font-size:12px; color:{ticker_pnl_color};'>"
-                    f"{pnl_display} ({pnl_rate:+.1%})</span>",
+                    f"<span style='font-size:16px;'>{eval_display} ({percent:.1f}%)</span>",
                     unsafe_allow_html=True
                 )
                 label = "非表示" if not is_hidden else "再表示"
@@ -298,25 +304,6 @@ if uploaded_file:
             return "#cc3333"
         else:
             return "#ff6666"
-
-    def classify_pnl_color(rate):
-        """含み損益率に基づく色分け"""
-        if rate >= 0.50:
-            return "#00cc44"
-        elif rate >= 0.20:
-            return "#00aa33"
-        elif rate >= 0.10:
-            return "#008822"
-        elif rate > 0.0:
-            return "#004411"
-        elif rate == 0.0:
-            return "#e0e0e0"
-        elif rate > -0.10:
-            return "#6e4444"
-        elif rate > -0.20:
-            return "#cc3333"
-        else:
-            return "#ff4444"
 
     display_position = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)].copy()
 
@@ -392,84 +379,55 @@ if uploaded_file:
                 ax2.axis('off')
                 st.pyplot(fig2, use_container_width=False)
 
-        # 含み損益ヒートマップ
-        with st.container(border=True):
-            st.markdown("### 含み損益ヒートマップ")
-            if len(display_position) > 0:
-                pnl_vals = display_position.copy()
-                pnl_sizes = pnl_vals["評価額"]
-                pnl_colors = [classify_pnl_color(v) for v in pnl_vals["含み損益率"]]
-                pnl_min, pnl_max = min(pnl_sizes), max(pnl_sizes)
-                pnl_font_sizes = [
-                    int(min_font + (s - pnl_min) / (pnl_max - pnl_min) * (max_font - min_font))
-                    if pnl_max > pnl_min else min_font for s in pnl_sizes
-                ]
-
-                fig4, ax4 = plt.subplots(figsize=(3, 3), facecolor='#0E1117')
-                normed_pnl = squarify.normalize_sizes(pnl_sizes, 600, 400)
-                rects_pnl = squarify.squarify(normed_pnl, 0, 0, 600, 400)
-
-                for rect, color, lbl, rate, fs in zip(rects_pnl, pnl_colors, pnl_vals.index.tolist(), pnl_vals["含み損益率"], pnl_font_sizes):
-                    x, y, dx, dy = rect['x'], rect['y'], rect['dx'], rect['dy']
-                    ax4.add_patch(plt.Rectangle((x, y), dx, dy, facecolor=color, edgecolor="black", linewidth=1))
-                    text = f"{lbl}\n{rate * 100:+.1f}%"
-                    if fs < 6 or dx < 20 or dy < 20:
-                        continue
-                    ax4.text(x + dx / 2, y + dy / 2, text, color='white', ha='center', va='center', fontsize=fs)
-
-                ax4.set_xlim(0, 600)
-                ax4.set_ylim(0, 400)
-                ax4.invert_yaxis()
-                ax4.axis('off')
-                st.pyplot(fig4, use_container_width=False)
-
     # =============================
-    # 銘柄別リスク指標
+    # 銘柄別リスク・バリュエーション指標
     # =============================
-    with st.expander("銘柄別リスク指標"):
-        risk_df = position[["セクター", "評価額"]].copy()
-        risk_df["構成比"] = risk_df["評価額"] / risk_df["評価額"].sum()
-        risk_df["β値"] = position["β値"]
-        risk_df["年率ボラティリティ"] = position["ボラティリティ"]
-        risk_df["含み損益率"] = position["含み損益率"]
+    st.markdown("### 銘柄別リスク・バリュエーション指標")
+    metrics_df = position[["セクター", "評価額"]].copy()
+    metrics_df["構成比"] = metrics_df["評価額"] / metrics_df["評価額"].sum()
+    metrics_df["β値"] = position["β値"]
+    metrics_df["年率Vol"] = position["ボラティリティ"]
+    metrics_df["PER"] = position["PER"]
+    metrics_df["予想PER"] = position["予想PER"]
+    metrics_df["PBR"] = position["PBR"]
+    metrics_df["配当利回り"] = position["配当利回り"]
+    metrics_df["EPS"] = position["EPS"]
+    metrics_df["時価総額(B$)"] = position["時価総額"].apply(
+        lambda v: v / 1e9 if pd.notna(v) else None
+    )
 
-        format_dict = {
+    fmt_or_na = lambda fmt: (lambda v: fmt.format(v) if pd.notna(v) else "N/A")
+
+    st.dataframe(
+        metrics_df.style.format({
             "評価額": "${:,.2f}",
             "構成比": "{:.1%}",
-            "含み損益率": "{:+.1%}",
-        }
-
-        def fmt_float(val, fmt_str):
-            if pd.isna(val):
-                return "N/A"
-            return fmt_str.format(val)
-
-        styled = risk_df.style.format({
-            "評価額": "${:,.2f}",
-            "構成比": "{:.1%}",
-            "含み損益率": "{:+.1%}",
-            "β値": lambda v: f"{v:.2f}" if pd.notna(v) else "N/A",
-            "年率ボラティリティ": lambda v: f"{v:.1%}" if pd.notna(v) else "N/A",
-        })
-        st.dataframe(styled, use_container_width=True)
+            "β値": fmt_or_na("{:.2f}"),
+            "年率Vol": fmt_or_na("{:.1%}"),
+            "PER": fmt_or_na("{:.1f}"),
+            "予想PER": fmt_or_na("{:.1f}"),
+            "PBR": fmt_or_na("{:.1f}"),
+            "配当利回り": fmt_or_na("{:.2%}"),
+            "EPS": fmt_or_na("${:.2f}"),
+            "時価総額(B$)": fmt_or_na("{:.1f}"),
+        }),
+        use_container_width=True,
+    )
 
     # =============================
     # 詳細データフレーム
     # =============================
     with st.expander("詳細データフレーム"):
+        detail_cols = ["signed_qty", "金額", "平均取得単価", "現在株価", "前日終値", "評価額", "騰落率", "セクター"]
         st.dataframe(
-            position.style.format({
+            position[detail_cols].style.format({
                 "signed_qty": "{:,.0f}",
                 "金額": "${:,.2f}",
                 "平均取得単価": "${:,.2f}",
                 "現在株価": "${:,.2f}",
                 "前日終値": "${:,.2f}",
                 "評価額": "${:,.2f}",
-                "含み損益": "${:,.2f}",
-                "含み損益率": "{:+.2%}",
                 "騰落率": "{:.2%}",
-                "β値": lambda v: f"{v:.2f}" if pd.notna(v) else "N/A",
-                "ボラティリティ": lambda v: f"{v:.1%}" if pd.notna(v) else "N/A",
             })
         )
 
