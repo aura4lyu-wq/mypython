@@ -4,15 +4,22 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import squarify
-import matplotlib.colors as mcolors
 import numpy as np
 import os
 import glob
 
-# フォント設定
-font_path = 'C:/Windows/Fonts/meiryo.ttc'
-font_prop = fm.FontProperties(fname=font_path)
-plt.rcParams['font.family'] = font_prop.get_name()
+# フォント設定（環境に応じたフォールバック）
+font_candidates = [
+    'C:/Windows/Fonts/meiryo.ttc',
+    '/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc',
+    '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc',
+    '/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc',
+]
+for fp in font_candidates:
+    if os.path.exists(fp):
+        font_prop = fm.FontProperties(fname=fp)
+        plt.rcParams['font.family'] = font_prop.get_name()
+        break
 
 st.set_page_config(page_title="ポートフォリオ可視化", layout="wide")
 st.title("SBI証券 ポートフォリオ")
@@ -20,7 +27,43 @@ st.title("SBI証券 ポートフォリオ")
 cash_usd = st.number_input("現金保有額 (USD)", min_value=0.0, value=0.0, step=100.0)
 cash_jpy = st.number_input("現金保有額 (日本円)", min_value=0.0, value=0.0, step=100.0)
 
-# ファイルアップロード（手動 or 自動で最新ファイルを選択）
+
+# --- キャッシュ付きデータ取得関数 ---
+
+@st.cache_data(ttl=300)
+def fetch_stock_info(ticker):
+    """銘柄情報を取得（5分キャッシュ）"""
+    try:
+        data = yf.Ticker(ticker).info
+        return {
+            "price": data.get("regularMarketPrice"),
+            "prev_close": data.get("previousClose"),
+            "sector": data.get("sector", "その他"),
+        }
+    except Exception:
+        return {"price": None, "prev_close": None, "sector": "その他"}
+
+
+@st.cache_data(ttl=300)
+def fetch_history(ticker, period="6mo"):
+    """過去の価格推移を取得（5分キャッシュ）"""
+    try:
+        hist = yf.Ticker(ticker).history(period=period)
+        return hist["Close"]
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+@st.cache_data(ttl=300)
+def fetch_fx_rate():
+    try:
+        return yf.Ticker("JPY=X").info["regularMarketPrice"]
+    except Exception:
+        return 150.0
+
+
+# --- ファイル読み込み ---
+
 with st.expander("CSVファイルをアップロード／自動選択"):
     uploaded_file = st.file_uploader("SBI証券の約定履歴CSVをアップロード", type="csv")
 
@@ -51,15 +94,10 @@ if uploaded_file:
     previous_closes = {}
     sectors = {}
     for ticker in tickers:
-        try:
-            data = yf.Ticker(ticker).info
-            current_prices[ticker] = data.get("regularMarketPrice")
-            previous_closes[ticker] = data.get("previousClose")
-            sectors[ticker] = data.get("sector", "その他")
-        except:
-            current_prices[ticker] = None
-            previous_closes[ticker] = None
-            sectors[ticker] = "その他"
+        info = fetch_stock_info(ticker)
+        current_prices[ticker] = info["price"]
+        previous_closes[ticker] = info["prev_close"]
+        sectors[ticker] = info["sector"]
 
     position["現在株価"] = position.index.map(current_prices)
     position["前日終値"] = position.index.map(previous_closes)
@@ -67,14 +105,106 @@ if uploaded_file:
     position.dropna(subset=["現在株価", "前日終値"], inplace=True)
     position["評価額"] = position["signed_qty"] * position["現在株価"]
     position["含み損益"] = position["評価額"] - (position["signed_qty"] * position["平均取得単価"])
+    position["含み損益率"] = (position["現在株価"] - position["平均取得単価"]) / position["平均取得単価"]
     position["騰落率"] = (position["現在株価"] - position["前日終値"]) / position["前日終値"]
 
+    # --- リスク指標の計算 ---
+    spy_hist = fetch_history("SPY", "6mo")
+    spy_returns = spy_hist.pct_change().dropna()
+
+    stock_volatilities = {}
+    stock_betas = {}
+    portfolio_weights = {}
+    stock_returns_dict = {}
+
+    total_eval = position["評価額"].sum()
+
+    for ticker in position.index:
+        hist = fetch_history(ticker, "6mo")
+        if len(hist) > 20:
+            returns = hist.pct_change().dropna()
+            stock_returns_dict[ticker] = returns
+            # 年率換算ボラティリティ
+            stock_volatilities[ticker] = returns.std() * np.sqrt(252)
+            # β値（SPYとの共分散 / SPYの分散）
+            aligned = pd.concat([returns, spy_returns], axis=1, join="inner")
+            aligned.columns = ["stock", "spy"]
+            if len(aligned) > 20:
+                cov = aligned.cov()
+                stock_betas[ticker] = cov.loc["stock", "spy"] / cov.loc["spy", "spy"]
+            else:
+                stock_betas[ticker] = None
+        else:
+            stock_volatilities[ticker] = None
+            stock_betas[ticker] = None
+
+        portfolio_weights[ticker] = position.at[ticker, "評価額"] / total_eval if total_eval > 0 else 0
+
+    position["ボラティリティ"] = position.index.map(stock_volatilities)
+    position["β値"] = position.index.map(stock_betas)
+
+    # ポートフォリオ全体のリスク指標
+    if stock_returns_dict:
+        returns_df = pd.DataFrame(stock_returns_dict).fillna(0)
+        weights = pd.Series({t: portfolio_weights[t] for t in returns_df.columns})
+        weights = weights / weights.sum()
+        portfolio_daily_returns = returns_df.mul(weights).sum(axis=1)
+
+        portfolio_annual_return = portfolio_daily_returns.mean() * 252
+        portfolio_annual_vol = portfolio_daily_returns.std() * np.sqrt(252)
+        risk_free_rate = 0.045
+        sharpe_ratio = (portfolio_annual_return - risk_free_rate) / portfolio_annual_vol if portfolio_annual_vol > 0 else 0
+
+        # ポートフォリオβ値（加重平均）
+        portfolio_beta = sum(
+            portfolio_weights[t] * (stock_betas.get(t) or 0)
+            for t in position.index
+        )
+
+        # 最大ドローダウン
+        cumulative = (1 + portfolio_daily_returns).cumprod()
+        peak = cumulative.cummax()
+        drawdown = (cumulative - peak) / peak
+        max_drawdown = drawdown.min()
+    else:
+        portfolio_annual_return = 0
+        portfolio_annual_vol = 0
+        sharpe_ratio = 0
+        portfolio_beta = 0
+        max_drawdown = 0
+
+    # --- セッション状態 ---
     if "hidden_tickers" not in st.session_state:
         st.session_state.hidden_tickers = set()
     if "show_yen" not in st.session_state:
         st.session_state.show_yen = False
 
     sorted_position = position.sort_values("評価額", ascending=False).copy()
+    fx_rate = fetch_fx_rate()
+
+    # =============================
+    # リスク指標サマリー
+    # =============================
+    st.markdown("### リスク指標")
+    risk_col1, risk_col2, risk_col3, risk_col4 = st.columns(4)
+    with risk_col1:
+        st.metric("ポートフォリオβ値", f"{portfolio_beta:.2f}",
+                  help="1.0 = 市場(S&P500)と同じリスク。1超は市場より高リスク")
+    with risk_col2:
+        st.metric("年率ボラティリティ", f"{portfolio_annual_vol * 100:.1f}%",
+                  help="ポートフォリオ全体の年率換算変動率（過去6ヶ月）")
+    with risk_col3:
+        st.metric("シャープレシオ", f"{sharpe_ratio:.2f}",
+                  help="リスク調整後リターン。高いほどリスクに対するリターンが効率的")
+    with risk_col4:
+        st.metric("最大ドローダウン", f"{max_drawdown * 100:.1f}%",
+                  help="過去6ヶ月間の最大下落幅")
+
+    st.markdown("---")
+
+    # =============================
+    # メイン3カラム
+    # =============================
     col1, col2, col3 = st.columns([1, 1, 1])
 
     with col1:
@@ -84,48 +214,62 @@ if uploaded_file:
             if st.button("USD⇔JPY"):
                 st.session_state.show_yen = not st.session_state.show_yen
 
-            try:
-                fx_rate = yf.Ticker("JPY=X").info["regularMarketPrice"]
-            except:
-                fx_rate = 150.0
-                
             total_value = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)]["評価額"].sum()
             total_value = total_value + cash_usd + (cash_jpy / fx_rate)
-            
+
+            # 含み損益の合計
+            total_pnl = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)]["含み損益"].sum()
+            total_cost = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)].apply(
+                lambda r: r["signed_qty"] * r["平均取得単価"], axis=1
+            ).sum()
+            total_pnl_rate = (total_pnl / total_cost * 100) if total_cost > 0 else 0
+            pnl_color = "#00ff88" if total_pnl >= 0 else "#ff4444"
+
             if st.session_state.show_yen:
-                total_value = total_value * fx_rate
-                st.markdown(f"""
-                <div style='text-align: center;'>
-                    <p style='font-size:13px; margin: 0;'>株式総評価額</p>
-                    <p style='font-size:32px; font-weight: bold; margin: 0;'>
-                        {total_value:,.0f} <span style='font-size:14px;'>円</span>
-                    </p>
-                </div><br>
-                """, unsafe_allow_html=True)
+                fmt_total = f"{total_value * fx_rate:,.0f}"
+                fmt_pnl = f"{total_pnl * fx_rate:+,.0f}"
+                currency_label = "円"
             else:
-                total_value = total_value
-                st.markdown(f"""
-                <div style='text-align: center;'>
-                    <p style='font-size:13px; margin: 0;'>株式総評価額</p>
-                    <p style='font-size:32px; font-weight: bold; margin: 0;'>
-                        {total_value:,.2f} <span style='font-size:14px;'>USD</span>
-                    </p>
-                </div><br>
-                """, unsafe_allow_html=True)
-                
+                fmt_total = f"{total_value:,.2f}"
+                fmt_pnl = f"{total_pnl:+,.2f}"
+                currency_label = "USD"
+
+            st.markdown(f"""
+            <div style='text-align: center;'>
+                <p style='font-size:13px; margin: 0;'>株式総評価額</p>
+                <p style='font-size:32px; font-weight: bold; margin: 0;'>
+                    {fmt_total} <span style='font-size:14px;'>{currency_label}</span>
+                </p>
+                <p style='font-size:16px; color: {pnl_color}; margin: 0;'>
+                    含み損益: {fmt_pnl} {currency_label} ({total_pnl_rate:+.2f}%)
+                </p>
+            </div><br>
+            """, unsafe_allow_html=True)
 
             for ticker in sorted_position.index:
                 is_hidden = ticker in st.session_state.hidden_tickers
                 eval_value = sorted_position.at[ticker, "評価額"] if not is_hidden else 0
+                pnl = sorted_position.at[ticker, "含み損益"] if not is_hidden else 0
+                pnl_rate = sorted_position.at[ticker, "含み損益率"] if not is_hidden else 0
+                ticker_pnl_color = "#00ff88" if pnl >= 0 else "#ff4444"
+
                 if st.session_state.show_yen:
                     eval_display = f"{eval_value * fx_rate:,.0f}"
+                    pnl_display = f"{pnl * fx_rate:+,.0f}"
                 else:
                     eval_display = f"{eval_value:,.2f}"
+                    pnl_display = f"{pnl:+,.2f}"
+
                 percent = (eval_value / total_value * 100) if total_value > 0 else 0
+
                 cols = st.columns([2, 3, 2])
                 cols[0].markdown(f"<span style='font-size:18px;'>{ticker}</span>", unsafe_allow_html=True)
-                cols[1].markdown(f"<span style='font-size:16px;'>{eval_display} ({percent:.1f}%)</span>", unsafe_allow_html=True)
-                button_style = "background-color: #28a745; color: white;" if not is_hidden else "background-color: #dc3545; color: white;"
+                cols[1].markdown(
+                    f"<span style='font-size:16px;'>{eval_display} ({percent:.1f}%)</span><br>"
+                    f"<span style='font-size:12px; color:{ticker_pnl_color};'>"
+                    f"{pnl_display} ({pnl_rate:+.1%})</span>",
+                    unsafe_allow_html=True
+                )
                 label = "非表示" if not is_hidden else "再表示"
                 if cols[2].button(label, key=f"toggle_{ticker}"):
                     if is_hidden:
@@ -136,6 +280,8 @@ if uploaded_file:
             if st.button("すべて再表示"):
                 st.session_state.hidden_tickers.clear()
                 st.rerun()
+
+    # --- 色分け関数 ---
 
     def classify_color(rate):
         if rate >= 0.02:
@@ -153,30 +299,44 @@ if uploaded_file:
         else:
             return "#ff6666"
 
+    def classify_pnl_color(rate):
+        """含み損益率に基づく色分け"""
+        if rate >= 0.50:
+            return "#00cc44"
+        elif rate >= 0.20:
+            return "#00aa33"
+        elif rate >= 0.10:
+            return "#008822"
+        elif rate > 0.0:
+            return "#004411"
+        elif rate == 0.0:
+            return "#e0e0e0"
+        elif rate > -0.10:
+            return "#6e4444"
+        elif rate > -0.20:
+            return "#cc3333"
+        else:
+            return "#ff4444"
+
     display_position = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)].copy()
 
     with col2:
         with st.container(border=True):
             st.markdown("### 銘柄別保有比率")
             pie_data = display_position["評価額"].copy()
-            pie_data.loc["現金"] = cash_usd + (cash_jpy / fx_rate)  # 現金を追加
+            pie_data.loc["現金"] = cash_usd + (cash_jpy / fx_rate)
             labels = pie_data.index.tolist()
             sizes = pie_data.tolist()
 
-            # 色設定：現金は灰色、それ以外は自動色
             base_colors = plt.cm.tab20.colors
-            color_map = ["#0E1117" if label == "現金" else base_colors[i % len(base_colors)] for i, label in enumerate(labels)]
+            color_map = ["#555555" if label == "現金" else base_colors[i % len(base_colors)] for i, label in enumerate(labels)]
 
-            fig1, ax1 = plt.subplots(figsize=(3,3), facecolor='#0E1117')
+            fig1, ax1 = plt.subplots(figsize=(3, 3), facecolor='#0E1117')
             ax1.pie(
-                sizes,
-                labels=labels,
-                colors=color_map,
-                startangle=90,
-                autopct='%1.1f%%',
-                counterclock=False,
+                sizes, labels=labels, colors=color_map,
+                startangle=90, autopct='%1.1f%%', counterclock=False,
                 textprops={"fontsize": 8, "color": "white"},
-                wedgeprops={'linewidth': 0.5, 'edgecolor':"white"}
+                wedgeprops={'linewidth': 0.5, 'edgecolor': "white"}
             )
             ax1.axis('equal')
             st.pyplot(fig1, use_container_width=False)
@@ -184,54 +344,119 @@ if uploaded_file:
         with st.container(border=True):
             st.markdown("### セクター別保有比率")
             sector_group = display_position.groupby("セクター")["評価額"].sum().sort_values(ascending=False)
-            sector_group.loc["現金"] = cash_usd + (cash_jpy / fx_rate)  # 現金を追加
+            sector_group.loc["現金"] = cash_usd + (cash_jpy / fx_rate)
             sector_labels = []
             for sector in sector_group.index:
                 tickers_in_sector = display_position[display_position["セクター"] == sector].index.tolist()
                 label = f"{sector}\n({', '.join(tickers_in_sector)})"
                 sector_labels.append(label)
-            fig3, ax3 = plt.subplots(figsize=(3,3), facecolor='#0E1117')
+            fig3, ax3 = plt.subplots(figsize=(3, 3), facecolor='#0E1117')
             ax3.pie(
-                sector_group,
-                labels=sector_labels,
-                startangle=90,
-                autopct='%1.1f%%',
-                counterclock=False,
+                sector_group, labels=sector_labels,
+                startangle=90, autopct='%1.1f%%', counterclock=False,
                 textprops={"fontsize": 6, "color": "white"},
-                wedgeprops={'linewidth': 0.5, 'edgecolor':"white"}
+                wedgeprops={'linewidth': 0.5, 'edgecolor': "white"}
             )
             ax3.axis('equal')
-            st.pyplot(fig3,use_container_width=False)
+            st.pyplot(fig3, use_container_width=False)
 
     with col3:
         with st.container(border=True):
             st.markdown("### 前日比騰落率ヒートマップ")
-            values = display_position.copy()
-            sizes = values["評価額"]
-            colors = [classify_color(v) for v in values["騰落率"]]
-            min_font, max_font = 6, 20
-            min_size, max_size = min(sizes), max(sizes)
-            font_sizes = [int(min_font + (s - min_size) / (max_size - min_size) * (max_font - min_font)) if max_size > min_size else min_font for s in sizes]
+            if len(display_position) > 0:
+                values = display_position.copy()
+                sizes_tm = values["評価額"]
+                colors_tm = [classify_color(v) for v in values["騰落率"]]
+                min_font, max_font = 6, 20
+                min_size, max_size = min(sizes_tm), max(sizes_tm)
+                font_sizes = [
+                    int(min_font + (s - min_size) / (max_size - min_size) * (max_font - min_font))
+                    if max_size > min_size else min_font for s in sizes_tm
+                ]
 
-            fig2, ax2 = plt.subplots(figsize=(3,3), facecolor='#0E1117')
-            normed_sizes = squarify.normalize_sizes(sizes, 600, 400)
-            rects = squarify.squarify(normed_sizes, 0, 0, 600, 400)
+                fig2, ax2 = plt.subplots(figsize=(3, 3), facecolor='#0E1117')
+                normed_sizes = squarify.normalize_sizes(sizes_tm, 600, 400)
+                rects = squarify.squarify(normed_sizes, 0, 0, 600, 400)
 
-            for rect, color, label, rate, font_size in zip(rects, colors, values.index.tolist(), values["騰落率"], font_sizes):
-                x, y, dx, dy = rect['x'], rect['y'], rect['dx'], rect['dy']
-                ax2.add_patch(plt.Rectangle((x, y), dx, dy, facecolor=color, edgecolor="black", linewidth=1))
-                text = f"{label}\n{rate*100:.2f}%"
-                if font_size < 6 or dx < 20 or dy < 20:
-                    continue
-                ax2.text(x + dx / 2, y + dy / 2, text, color='white', ha='center', va='center', fontsize=font_size)
+                for rect, color, lbl, rate, fs in zip(rects, colors_tm, values.index.tolist(), values["騰落率"], font_sizes):
+                    x, y, dx, dy = rect['x'], rect['y'], rect['dx'], rect['dy']
+                    ax2.add_patch(plt.Rectangle((x, y), dx, dy, facecolor=color, edgecolor="black", linewidth=1))
+                    text = f"{lbl}\n{rate * 100:.2f}%"
+                    if fs < 6 or dx < 20 or dy < 20:
+                        continue
+                    ax2.text(x + dx / 2, y + dy / 2, text, color='white', ha='center', va='center', fontsize=fs)
 
-            ax2.set_xlim(0, 600)
-            ax2.set_ylim(0, 400)
-            ax2.invert_yaxis()
-            ax2.axis('off')
-            st.pyplot(fig2, use_container_width=False)
+                ax2.set_xlim(0, 600)
+                ax2.set_ylim(0, 400)
+                ax2.invert_yaxis()
+                ax2.axis('off')
+                st.pyplot(fig2, use_container_width=False)
 
-    with st.expander("📋 詳細データフレーム"):
+        # 含み損益ヒートマップ
+        with st.container(border=True):
+            st.markdown("### 含み損益ヒートマップ")
+            if len(display_position) > 0:
+                pnl_vals = display_position.copy()
+                pnl_sizes = pnl_vals["評価額"]
+                pnl_colors = [classify_pnl_color(v) for v in pnl_vals["含み損益率"]]
+                pnl_min, pnl_max = min(pnl_sizes), max(pnl_sizes)
+                pnl_font_sizes = [
+                    int(min_font + (s - pnl_min) / (pnl_max - pnl_min) * (max_font - min_font))
+                    if pnl_max > pnl_min else min_font for s in pnl_sizes
+                ]
+
+                fig4, ax4 = plt.subplots(figsize=(3, 3), facecolor='#0E1117')
+                normed_pnl = squarify.normalize_sizes(pnl_sizes, 600, 400)
+                rects_pnl = squarify.squarify(normed_pnl, 0, 0, 600, 400)
+
+                for rect, color, lbl, rate, fs in zip(rects_pnl, pnl_colors, pnl_vals.index.tolist(), pnl_vals["含み損益率"], pnl_font_sizes):
+                    x, y, dx, dy = rect['x'], rect['y'], rect['dx'], rect['dy']
+                    ax4.add_patch(plt.Rectangle((x, y), dx, dy, facecolor=color, edgecolor="black", linewidth=1))
+                    text = f"{lbl}\n{rate * 100:+.1f}%"
+                    if fs < 6 or dx < 20 or dy < 20:
+                        continue
+                    ax4.text(x + dx / 2, y + dy / 2, text, color='white', ha='center', va='center', fontsize=fs)
+
+                ax4.set_xlim(0, 600)
+                ax4.set_ylim(0, 400)
+                ax4.invert_yaxis()
+                ax4.axis('off')
+                st.pyplot(fig4, use_container_width=False)
+
+    # =============================
+    # 銘柄別リスク指標
+    # =============================
+    with st.expander("銘柄別リスク指標"):
+        risk_df = position[["セクター", "評価額"]].copy()
+        risk_df["構成比"] = risk_df["評価額"] / risk_df["評価額"].sum()
+        risk_df["β値"] = position["β値"]
+        risk_df["年率ボラティリティ"] = position["ボラティリティ"]
+        risk_df["含み損益率"] = position["含み損益率"]
+
+        format_dict = {
+            "評価額": "${:,.2f}",
+            "構成比": "{:.1%}",
+            "含み損益率": "{:+.1%}",
+        }
+
+        def fmt_float(val, fmt_str):
+            if pd.isna(val):
+                return "N/A"
+            return fmt_str.format(val)
+
+        styled = risk_df.style.format({
+            "評価額": "${:,.2f}",
+            "構成比": "{:.1%}",
+            "含み損益率": "{:+.1%}",
+            "β値": lambda v: f"{v:.2f}" if pd.notna(v) else "N/A",
+            "年率ボラティリティ": lambda v: f"{v:.1%}" if pd.notna(v) else "N/A",
+        })
+        st.dataframe(styled, use_container_width=True)
+
+    # =============================
+    # 詳細データフレーム
+    # =============================
+    with st.expander("詳細データフレーム"):
         st.dataframe(
             position.style.format({
                 "signed_qty": "{:,.0f}",
@@ -241,7 +466,10 @@ if uploaded_file:
                 "前日終値": "${:,.2f}",
                 "評価額": "${:,.2f}",
                 "含み損益": "${:,.2f}",
-                "騰落率": "{:.2%}"
+                "含み損益率": "{:+.2%}",
+                "騰落率": "{:.2%}",
+                "β値": lambda v: f"{v:.2f}" if pd.notna(v) else "N/A",
+                "ボラティリティ": lambda v: f"{v:.1%}" if pd.notna(v) else "N/A",
             })
         )
 
