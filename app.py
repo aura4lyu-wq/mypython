@@ -22,10 +22,41 @@ for fp in font_candidates:
         break
 
 st.set_page_config(page_title="ポートフォリオ可視化", layout="wide")
-st.title("SBI証券 ポートフォリオ")
 
-cash_usd = st.number_input("現金保有額 (USD)", min_value=0.0, value=0.0, step=100.0)
-cash_jpy = st.number_input("現金保有額 (日本円)", min_value=0.0, value=0.0, step=100.0)
+# --- グローバルCSS: 1920x1080向けコンパクト化 ---
+st.markdown("""
+<style>
+    /* メインコンテンツの上部余白を縮小 */
+    .block-container { padding-top: 1rem; padding-bottom: 0rem; }
+    /* 見出しの余白を縮小 */
+    h1, h2, h3 { margin-top: 0.2rem; margin-bottom: 0.2rem; }
+    /* st.metric の余白を縮小 */
+    [data-testid="stMetric"] { padding: 0.3rem 0; }
+    [data-testid="stMetricLabel"] { font-size: 0.8rem; }
+    [data-testid="stMetricValue"] { font-size: 1.3rem; }
+    /* ボタンを小さく */
+    .stButton > button { padding: 0.15rem 0.6rem; font-size: 0.8rem; }
+    /* dataframeの行高さを縮小 */
+    .stDataFrame { font-size: 0.85rem; }
+    /* expanderの余白縮小 */
+    .streamlit-expanderHeader { padding: 0.3rem 0; }
+    /* container内の余白を縮小 */
+    [data-testid="stVerticalBlock"] > div { gap: 0.3rem; }
+    /* number_inputを小さく */
+    .stNumberInput label { font-size: 0.85rem; margin-bottom: 0; }
+    .stNumberInput input { padding: 0.25rem 0.5rem; }
+    /* 区切り線の余白 */
+    hr { margin: 0.3rem 0; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("#### SBI証券 ポートフォリオ")
+
+cash_col1, cash_col2 = st.columns(2)
+with cash_col1:
+    cash_usd = st.number_input("現金 (USD)", min_value=0.0, value=0.0, step=100.0)
+with cash_col2:
+    cash_jpy = st.number_input("現金 (日本円)", min_value=0.0, value=0.0, step=100.0)
 
 
 # --- キャッシュ付きデータ取得関数 ---
@@ -211,7 +242,7 @@ if uploaded_file:
     # =============================
     # リスク指標サマリー
     # =============================
-    st.markdown("### リスク指標")
+    st.markdown("##### リスク指標")
     risk_col1, risk_col2, risk_col3, risk_col4 = st.columns(4)
     with risk_col1:
         st.metric("ポートフォリオβ値", f"{portfolio_beta:.2f}",
@@ -235,9 +266,9 @@ if uploaded_file:
 
     with col1:
         with st.container(border=True):
-            st.markdown("### 保有銘柄詳細")
-
-            if st.button("USD⇔JPY"):
+            hdr_col, btn_col = st.columns([3, 1])
+            hdr_col.markdown("##### 保有銘柄詳細")
+            if btn_col.button("USD⇔JPY", use_container_width=True):
                 st.session_state.show_yen = not st.session_state.show_yen
 
             total_value = sorted_position[~sorted_position.index.isin(st.session_state.hidden_tickers)]["評価額"].sum()
@@ -251,12 +282,12 @@ if uploaded_file:
                 currency_label = "USD"
 
             st.markdown(f"""
-            <div style='text-align: center;'>
-                <p style='font-size:13px; margin: 0;'>株式総評価額</p>
-                <p style='font-size:32px; font-weight: bold; margin: 0;'>
-                    {fmt_total} <span style='font-size:14px;'>{currency_label}</span>
-                </p>
-            </div><br>
+            <div style='text-align: center; margin: 0.2rem 0;'>
+                <span style='font-size:11px; color:#888;'>総評価額</span><br>
+                <span style='font-size:22px; font-weight: bold;'>
+                    {fmt_total} <span style='font-size:11px;'>{currency_label}</span>
+                </span>
+            </div>
             """, unsafe_allow_html=True)
 
             for ticker in sorted_position.index:
@@ -270,14 +301,14 @@ if uploaded_file:
 
                 percent = (eval_value / total_value * 100) if total_value > 0 else 0
 
-                cols = st.columns([2, 3, 2])
-                cols[0].markdown(f"<span style='font-size:18px;'>{ticker}</span>", unsafe_allow_html=True)
+                cols = st.columns([2, 3, 1])
+                cols[0].markdown(f"<span style='font-size:13px; font-weight:600;'>{ticker}</span>", unsafe_allow_html=True)
                 cols[1].markdown(
-                    f"<span style='font-size:16px;'>{eval_display} ({percent:.1f}%)</span>",
+                    f"<span style='font-size:12px;'>{eval_display} ({percent:.1f}%)</span>",
                     unsafe_allow_html=True
                 )
                 label = "非表示" if not is_hidden else "再表示"
-                if cols[2].button(label, key=f"toggle_{ticker}"):
+                if cols[2].button(label, key=f"toggle_{ticker}", use_container_width=True):
                     if is_hidden:
                         st.session_state.hidden_tickers.remove(ticker)
                     else:
@@ -309,7 +340,7 @@ if uploaded_file:
 
     with col2:
         with st.container(border=True):
-            st.markdown("### 銘柄別保有比率")
+            st.markdown("##### 銘柄別保有比率")
             pie_data = display_position["評価額"].copy()
             pie_data.loc["現金"] = cash_usd + (cash_jpy / fx_rate)
             labels = pie_data.index.tolist()
@@ -318,18 +349,18 @@ if uploaded_file:
             base_colors = plt.cm.tab20.colors
             color_map = ["#555555" if label == "現金" else base_colors[i % len(base_colors)] for i, label in enumerate(labels)]
 
-            fig1, ax1 = plt.subplots(figsize=(3, 3), facecolor='#0E1117')
+            fig1, ax1 = plt.subplots(figsize=(4, 2.8), facecolor='#0E1117')
             ax1.pie(
                 sizes, labels=labels, colors=color_map,
                 startangle=90, autopct='%1.1f%%', counterclock=False,
-                textprops={"fontsize": 8, "color": "white"},
+                textprops={"fontsize": 7, "color": "white"},
                 wedgeprops={'linewidth': 0.5, 'edgecolor': "white"}
             )
             ax1.axis('equal')
-            st.pyplot(fig1, use_container_width=False)
+            st.pyplot(fig1, use_container_width=True)
 
         with st.container(border=True):
-            st.markdown("### セクター別保有比率")
+            st.markdown("##### セクター別保有比率")
             sector_group = display_position.groupby("セクター")["評価額"].sum().sort_values(ascending=False)
             sector_group.loc["現金"] = cash_usd + (cash_jpy / fx_rate)
             sector_labels = []
@@ -337,31 +368,31 @@ if uploaded_file:
                 tickers_in_sector = display_position[display_position["セクター"] == sector].index.tolist()
                 label = f"{sector}\n({', '.join(tickers_in_sector)})"
                 sector_labels.append(label)
-            fig3, ax3 = plt.subplots(figsize=(3, 3), facecolor='#0E1117')
+            fig3, ax3 = plt.subplots(figsize=(4, 2.8), facecolor='#0E1117')
             ax3.pie(
                 sector_group, labels=sector_labels,
                 startangle=90, autopct='%1.1f%%', counterclock=False,
-                textprops={"fontsize": 6, "color": "white"},
+                textprops={"fontsize": 5, "color": "white"},
                 wedgeprops={'linewidth': 0.5, 'edgecolor': "white"}
             )
             ax3.axis('equal')
-            st.pyplot(fig3, use_container_width=False)
+            st.pyplot(fig3, use_container_width=True)
 
     with col3:
         with st.container(border=True):
-            st.markdown("### 前日比騰落率ヒートマップ")
+            st.markdown("##### 前日比騰落率ヒートマップ")
             if len(display_position) > 0:
                 values = display_position.copy()
                 sizes_tm = values["評価額"]
                 colors_tm = [classify_color(v) for v in values["騰落率"]]
-                min_font, max_font = 6, 20
+                min_font, max_font = 5, 14
                 min_size, max_size = min(sizes_tm), max(sizes_tm)
                 font_sizes = [
                     int(min_font + (s - min_size) / (max_size - min_size) * (max_font - min_font))
                     if max_size > min_size else min_font for s in sizes_tm
                 ]
 
-                fig2, ax2 = plt.subplots(figsize=(3, 3), facecolor='#0E1117')
+                fig2, ax2 = plt.subplots(figsize=(5, 5.5), facecolor='#0E1117')
                 normed_sizes = squarify.normalize_sizes(sizes_tm, 600, 400)
                 rects = squarify.squarify(normed_sizes, 0, 0, 600, 400)
 
@@ -369,7 +400,7 @@ if uploaded_file:
                     x, y, dx, dy = rect['x'], rect['y'], rect['dx'], rect['dy']
                     ax2.add_patch(plt.Rectangle((x, y), dx, dy, facecolor=color, edgecolor="black", linewidth=1))
                     text = f"{lbl}\n{rate * 100:.2f}%"
-                    if fs < 6 or dx < 20 or dy < 20:
+                    if fs < 5 or dx < 15 or dy < 15:
                         continue
                     ax2.text(x + dx / 2, y + dy / 2, text, color='white', ha='center', va='center', fontsize=fs)
 
@@ -377,12 +408,12 @@ if uploaded_file:
                 ax2.set_ylim(0, 400)
                 ax2.invert_yaxis()
                 ax2.axis('off')
-                st.pyplot(fig2, use_container_width=False)
+                st.pyplot(fig2, use_container_width=True)
 
     # =============================
     # 銘柄別リスク・バリュエーション指標
     # =============================
-    st.markdown("### 銘柄別リスク・バリュエーション指標")
+    st.markdown("##### 銘柄別リスク・バリュエーション指標")
     metrics_df = position[["セクター", "評価額"]].copy()
     metrics_df["構成比"] = metrics_df["評価額"] / metrics_df["評価額"].sum()
     metrics_df["β値"] = position["β値"]
