@@ -14,6 +14,8 @@ import sys
 import io
 import re
 import time
+import queue
+import threading
 import argparse
 import requests
 import fitz  # PyMuPDF
@@ -273,37 +275,72 @@ def main() -> None:
     # ── pygame 初期化 ───────────────────────────────────────
     pygame.mixer.init(frequency=24000, size=-16, channels=1, buffer=512)
 
-    # ── 読み上げループ ──────────────────────────────────────
-    try:
-        for page_idx in range(start_page - 1, total_pages):
-            page_num = page_idx + 1
-            page_text = pages[page_idx]
+    # ── 全チャンクをフラットに列挙 ──────────────────────────
+    all_chunks: list[tuple] = []
+    for page_idx in range(start_page - 1, total_pages):
+        page_num = page_idx + 1
+        text = pages[page_idx]
+        if not text.strip():
+            continue
+        chunks = split_into_chunks(text, args.chunk_size)
+        tc = len(chunks)
+        for ci, chunk in enumerate(chunks, 1):
+            if chunk.strip():
+                all_chunks.append((page_num, total_pages, ci, tc, chunk))
 
-            if not page_text.strip():
-                print(f"\n── ページ {page_num}/{total_pages} (空白ページ) ──")
+    # ── プロデューサー/コンシューマー方式で再生 ────────────
+    # 合成スレッドが最大 2 チャンク先読みし、再生側は待ち時間なし
+    stop_flag = threading.Event()
+    wav_queue: queue.Queue = queue.Queue(maxsize=2)
+    synthesis_done = threading.Event()
+
+    def synthesizer():
+        for item in all_chunks:
+            if stop_flag.is_set():
+                break
+            _, _, _, _, chunk = item
+            wav = synthesize(chunk, args.speaker, args.speed, base_url)
+            while not stop_flag.is_set():
+                try:
+                    wav_queue.put((item, wav), timeout=0.2)
+                    break
+                except queue.Full:
+                    continue
+        synthesis_done.set()
+
+    syn = threading.Thread(target=synthesizer, daemon=True)
+    syn.start()
+
+    try:
+        prev_page = -1
+        while True:
+            try:
+                entry = wav_queue.get(timeout=0.2)
+            except queue.Empty:
+                if synthesis_done.is_set():
+                    break
                 continue
 
-            print(f"\n── ページ {page_num}/{total_pages} ──")
+            (page_num, total_p, ci, tc, chunk), wav = entry
 
-            chunks = split_into_chunks(page_text, args.chunk_size)
-            total_chunks = len(chunks)
+            if page_num != prev_page:
+                print(f"\n── ページ {page_num}/{total_p} ──")
+                prev_page = page_num
 
-            for chunk_idx, chunk in enumerate(chunks, 1):
-                if not chunk.strip():
-                    continue
-
-                print(f"  [{chunk_idx}/{total_chunks}] {truncate(chunk)}")
-
-                wav = synthesize(chunk, args.speaker, args.speed, base_url)
-                if wav:
-                    play_wav(wav)
+            print(f"  [{ci}/{tc}] {truncate(chunk)}")
+            if wav:
+                play_wav(wav)
 
     except KeyboardInterrupt:
+        stop_flag.set()
         print("\n\n読み上げを停止しました。")
     finally:
+        stop_flag.set()
+        syn.join(timeout=2)
         pygame.mixer.quit()
 
-    print("\n読み上げ完了！")
+    if not stop_flag.is_set():
+        print("\n読み上げ完了！")
 
 
 if __name__ == "__main__":
