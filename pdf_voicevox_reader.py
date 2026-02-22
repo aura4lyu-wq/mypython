@@ -106,40 +106,56 @@ def check_voicevox(base_url: str) -> list[dict] | None:
         return None
 
 
-def synthesize(text: str, speaker: int, speed: float, base_url: str) -> bytes | None:
+def clean_for_voicevox(text: str) -> str:
+    """VOICEVOX に送る前にAPIエラーの原因になる文字を除去する"""
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
+def synthesize(
+    text: str, speaker: int, speed: float, base_url: str,
+    max_retries: int = 2,
+) -> tuple[bytes | None, str | None]:
     """
-    テキストを音声合成して WAV バイト列を返す。
-    失敗時は None を返す。
+    テキストを音声合成して (WAVバイト列, None) を返す。
+    失敗時は (None, エラーメッセージ) を返す。
+    最大 max_retries 回リトライする。
     """
-    try:
-        # Step 1: audio_query でパラメータ取得
-        resp = requests.post(
-            f"{base_url}/audio_query",
-            params={"text": text, "speaker": speaker},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        query = resp.json()
+    text = clean_for_voicevox(text)
+    if not text:
+        return None, "空テキスト"
 
-        # 速度・音量調整
-        query["speedScale"] = speed
+    last_error: str = ""
+    for attempt in range(max_retries + 1):
+        try:
+            resp = requests.post(
+                f"{base_url}/audio_query",
+                params={"text": text, "speaker": speaker},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            query = resp.json()
+            query["speedScale"] = speed
 
-        # Step 2: synthesis で音声バイト列取得
-        resp = requests.post(
-            f"{base_url}/synthesis",
-            params={"speaker": speaker},
-            json=query,
-            timeout=30,
-        )
-        resp.raise_for_status()
-        return resp.content
+            resp = requests.post(
+                f"{base_url}/synthesis",
+                params={"speaker": speaker},
+                json=query,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.content, None
 
-    except requests.exceptions.Timeout:
-        print("  [警告] タイムアウト。スキップします。")
-        return None
-    except Exception as e:
-        print(f"  [合成エラー] {e}")
-        return None
+        except requests.HTTPError as e:
+            last_error = f"HTTP {e.response.status_code}"
+            break   # HTTPエラーはリトライしない
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries:
+                time.sleep(0.5 * (attempt + 1))
+
+    return None, last_error
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +315,10 @@ def main() -> None:
             if stop_flag.is_set():
                 break
             _, _, _, _, chunk = item
-            wav = synthesize(chunk, args.speaker, args.speed, base_url)
+            wav, err = synthesize(chunk, args.speaker, args.speed, base_url)
+            if err is not None:
+                preview = chunk[:50] + ("…" if len(chunk) > 50 else "")
+                print(f"  [合成失敗（スキップ）] 「{preview}」 → {err}")
             while not stop_flag.is_set():
                 try:
                     wav_queue.put((item, wav), timeout=0.2)
@@ -328,7 +347,7 @@ def main() -> None:
                 prev_page = page_num
 
             print(f"  [{ci}/{tc}] {truncate(chunk)}")
-            if wav:
+            if wav is not None:
                 play_wav(wav)
 
     except KeyboardInterrupt:

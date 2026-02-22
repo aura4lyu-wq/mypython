@@ -123,32 +123,58 @@ def voicevox_get_speakers(base_url: str) -> list[dict] | None:
         return None
 
 
-def voicevox_synthesize(
-    text: str, speaker_id: int, speed: float, base_url: str
-) -> bytes | None:
-    """テキストを音声合成して WAV バイト列を返す。失敗時は None"""
-    try:
-        # Step1: audio_query
-        r = requests.post(
-            f"{base_url}/audio_query",
-            params={"text": text, "speaker": speaker_id},
-            timeout=15,
-        )
-        r.raise_for_status()
-        query = r.json()
-        query["speedScale"] = speed
+def clean_for_voicevox(text: str) -> str:
+    """VOICEVOX に送る前にAPIエラーの原因になる文字を除去する"""
+    # 制御文字（改行・タブ以外）を削除
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    # 連続スペースを1つに
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
 
-        # Step2: synthesis
-        r = requests.post(
-            f"{base_url}/synthesis",
-            params={"speaker": speaker_id},
-            json=query,
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.content
-    except Exception:
-        return None
+
+def voicevox_synthesize(
+    text: str, speaker_id: int, speed: float, base_url: str,
+    max_retries: int = 2,
+) -> tuple[bytes | None, str | None]:
+    """
+    テキストを音声合成して (WAVバイト列, None) を返す。
+    失敗時は (None, エラーメッセージ) を返す。
+    最大 max_retries 回リトライする。
+    """
+    text = clean_for_voicevox(text)
+    if not text:
+        return None, "空テキスト"
+
+    last_error: str = ""
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.post(
+                f"{base_url}/audio_query",
+                params={"text": text, "speaker": speaker_id},
+                timeout=15,
+            )
+            r.raise_for_status()
+            query = r.json()
+            query["speedScale"] = speed
+
+            r = requests.post(
+                f"{base_url}/synthesis",
+                params={"speaker": speaker_id},
+                json=query,
+                timeout=30,
+            )
+            r.raise_for_status()
+            return r.content, None
+
+        except requests.HTTPError as e:
+            last_error = f"HTTP {e.response.status_code}: {e.response.text[:80]}"
+            break   # HTTPエラーはリトライしない（テキスト起因の可能性）
+        except Exception as e:
+            last_error = str(e)
+            if attempt < max_retries:
+                time.sleep(0.5 * (attempt + 1))
+
+    return None, last_error
 
 
 def find_voicevox_executable() -> Path | None:
@@ -649,7 +675,12 @@ class App(tk.Tk):
                 if self.stop_event.is_set():
                     break
                 _, _, _, _, chunk = item
-                wav = voicevox_synthesize(chunk, speaker_id, speed, self.voicevox_url)
+                wav, err = voicevox_synthesize(
+                    chunk, speaker_id, speed, self.voicevox_url)
+                if err is not None:
+                    preview = chunk[:50] + ("…" if len(chunk) > 50 else "")
+                    self.log_queue.put(
+                        ("error", f"  合成失敗（スキップ）: 「{preview}」 → {err}"))
                 # キューが満杯のときは stop_event を見ながら待機
                 while not self.stop_event.is_set():
                     try:
