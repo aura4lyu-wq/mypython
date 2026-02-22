@@ -596,7 +596,13 @@ class App(tk.Tk):
         self._log("info", "停止しています...")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 読み上げスレッド
+    # 読み上げスレッド（プロデューサー/コンシューマー方式）
+    #
+    # 構造:
+    #   [合成スレッド] チャンクを先読み合成して wav_queue へ積む
+    #   [再生ループ ]  wav_queue から取り出して即再生
+    #
+    # これにより「再生中に次チャンクを合成」でき、チャンク間の無音を解消する。
     # ─────────────────────────────────────────────────────────────────────────
 
     def _reader_thread(
@@ -615,44 +621,81 @@ class App(tk.Tk):
 
         total = len(pages)
 
+        # ── 全チャンクをフラットなリストに展開 ────────────────────────────
+        all_chunks: list[tuple] = []   # (page_num, total, ci, tc, chunk_text)
         for page_idx in range(start_page - 1, total):
+            page_num = page_idx + 1
+            text = pages[page_idx]
+            if not text.strip():
+                continue
+            chunks = split_into_chunks(text)
+            tc = len(chunks)
+            for ci, chunk in enumerate(chunks, 1):
+                all_chunks.append((page_num, total, ci, tc, chunk))
+
+        if not all_chunks:
+            self.log_queue.put(("info", "読み上げるテキストが見つかりませんでした"))
+            self.status_queue.put(("done",))
+            return
+
+        # ── 先読みキュー (最大 2 チャンク分の WAV を保持) ────────────────
+        # maxsize=2: 再生中に次・次々チャンクを合成しておける
+        wav_queue: queue.Queue = queue.Queue(maxsize=2)
+        synthesis_done = threading.Event()
+
+        # ── 合成スレッド（プロデューサー）────────────────────────────────
+        def synthesizer():
+            for item in all_chunks:
+                if self.stop_event.is_set():
+                    break
+                _, _, _, _, chunk = item
+                wav = voicevox_synthesize(chunk, speaker_id, speed, self.voicevox_url)
+                # キューが満杯のときは stop_event を見ながら待機
+                while not self.stop_event.is_set():
+                    try:
+                        wav_queue.put((item, wav), timeout=0.2)
+                        break
+                    except queue.Full:
+                        continue
+            synthesis_done.set()
+
+        syn_thread = threading.Thread(target=synthesizer, daemon=True)
+        syn_thread.start()
+
+        # ── 再生ループ（コンシューマー）──────────────────────────────────
+        prev_page = -1
+        while not self.stop_event.is_set():
+            # キューからアイテム取得（空のときは synthesis_done を確認）
+            try:
+                entry = wav_queue.get(timeout=0.2)
+            except queue.Empty:
+                if synthesis_done.is_set():
+                    break   # 全チャンク処理完了
+                continue
+
+            (page_num, total_p, ci, tc, chunk), wav = entry
+
+            # ページ切り替わりをログに表示
+            if page_num != prev_page:
+                self.log_queue.put(("read", f"── ページ {page_num} / {total_p} ──"))
+                prev_page = page_num
+
+            # 一時停止中は待機（合成スレッドは先読みを継続）
+            while self.pause_event.is_set() and not self.stop_event.is_set():
+                time.sleep(0.08)
+
             if self.stop_event.is_set():
                 break
 
-            page_num = page_idx + 1
-            text = pages[page_idx]
+            self.status_queue.put(("progress", page_num, total_p, ci, tc, chunk))
+            self.log_queue.put(
+                ("chunk", f"  [{ci}/{tc}] "
+                          f"{chunk[:70]}{'…' if len(chunk) > 70 else ''}"))
 
-            if not text.strip():
-                self.log_queue.put(("info",
-                    f"ページ {page_num}/{total}  (空白 - スキップ)"))
-                continue
+            if wav:
+                self._play_wav(wav)
 
-            self.log_queue.put(("read",
-                f"── ページ {page_num} / {total} ──"))
-            chunks = split_into_chunks(text)
-            total_chunks = len(chunks)
-
-            for ci, chunk in enumerate(chunks, 1):
-                if self.stop_event.is_set():
-                    break
-
-                # 一時停止を待機
-                while self.pause_event.is_set() and not self.stop_event.is_set():
-                    time.sleep(0.08)
-
-                if self.stop_event.is_set():
-                    break
-
-                self.status_queue.put(
-                    ("progress", page_num, total, ci, total_chunks, chunk))
-                self.log_queue.put(
-                    ("chunk", f"  [{ci}/{total_chunks}] "
-                              f"{chunk[:70]}{'…' if len(chunk) > 70 else ''}"))
-
-                wav = voicevox_synthesize(
-                    chunk, speaker_id, speed, self.voicevox_url)
-                if wav:
-                    self._play_wav(wav)
+        syn_thread.join(timeout=2)
 
         if self.stop_event.is_set():
             self.log_queue.put(("info", "読み上げを停止しました"))
