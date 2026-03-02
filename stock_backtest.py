@@ -32,6 +32,7 @@ Usage:
     python stock_backtest.py --list-stocks             # Screen only, no backtest
 """
 
+import re
 import sys
 import time
 import argparse
@@ -101,20 +102,36 @@ class FinvizScreener:
     """
     Scrapes Finviz's free screener to get qualifying stock tickers.
     Applies all fundamental and technical filters via URL parameters.
+
+    Finviz may block automated requests. When that happens the scraper
+    falls back automatically to a broader set of CSS selectors and a
+    regex-based ticker extraction from the raw HTML.
     """
 
     BASE_URL = "https://finviz.com/screener.ashx"
+    HOME_URL = "https://finviz.com/"
+    # Realistic browser headers including Referer
     HEADERS = {
         "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64; rv:122.0) "
-            "Gecko/20100101 Firefox/122.0"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
         "Cache-Control": "max-age=0",
     }
+    # Valid ticker: 1–5 uppercase letters (optionally ending with . + 1-2 letters)
+    _TICKER_RE = re.compile(r"^[A-Z]{1,5}(\.[A-Z]{1,2})?$")
 
     def __init__(self, filters: List[str] = FINVIZ_FILTERS):
         self.filters = filters
@@ -125,25 +142,94 @@ class FinvizScreener:
         f = ",".join(self.filters)
         return f"{self.BASE_URL}?v=111&f={f}&r={offset + 1}"
 
+    def _warm_up_session(self) -> None:
+        """Visit homepage first to obtain cookies and avoid bot detection."""
+        try:
+            self.session.get(self.HOME_URL, timeout=10)
+            self.session.headers["Referer"] = self.HOME_URL
+            time.sleep(0.8)
+        except Exception:
+            pass
+
     def _parse_tickers(self, html: str) -> List[str]:
+        """
+        Extract tickers from HTML using multiple strategies:
+        1. CSS class 'screener-link-primary' (Finviz standard)
+        2. CSS class 'tab-link' filtered to look like tickers
+        3. Regex scan of the raw HTML as last resort
+        """
         soup = BeautifulSoup(html, "html.parser")
-        return [a.text.strip() for a in soup.find_all("a", class_="screener-link-primary")]
+
+        # Strategy 1: standard class
+        found = [
+            a.text.strip()
+            for a in soup.find_all("a", class_="screener-link-primary")
+            if self._TICKER_RE.match(a.text.strip())
+        ]
+        if found:
+            return found
+
+        # Strategy 2: 'tab-link' anchors whose text looks like a ticker
+        found = [
+            a.text.strip()
+            for a in soup.find_all("a", class_="tab-link")
+            if self._TICKER_RE.match(a.text.strip())
+        ]
+        if found:
+            return found
+
+        # Strategy 3: find the screener results table and grab all cell text
+        table = soup.find("table", id="screener-views-table")
+        if not table:
+            table = soup.find("table", {"class": lambda c: c and "screener" in c})
+        if table:
+            found = [
+                td.get_text(strip=True)
+                for td in table.find_all("td")
+                if self._TICKER_RE.match(td.get_text(strip=True))
+            ]
+            if found:
+                return found
+
+        # Strategy 4: regex scan – look for ticker-like tokens in links
+        found = list(dict.fromkeys(
+            m.group(1)
+            for m in re.finditer(r'quote\.ashx\?t=([A-Z]{1,5})', html)
+        ))
+        return found
+
+    def _page_looks_blocked(self, html: str) -> bool:
+        """Heuristic: return True if Finviz returned a challenge/CAPTCHA page."""
+        blocked_signals = [
+            "enable javascript",
+            "captcha",
+            "please wait",
+            "cloudflare",
+            "access denied",
+            "403 forbidden",
+        ]
+        snippet = html[:4000].lower()
+        return any(sig in snippet for sig in blocked_signals)
 
     def screen(self) -> List[str]:
         """
         Fetch all qualifying tickers from Finviz.
-        Returns a list of ticker symbols.
+        Returns a list of ticker symbols, or an empty list on failure.
+        Raises RuntimeError only on hard network errors on the first request.
         """
+        self._warm_up_session()
+
         all_tickers: List[str] = []
         offset = 0
+        url0 = self._build_url()
 
         print("Connecting to Finviz screener...")
-        print(f"  URL: {self._build_url()}\n")
+        print(f"  URL: {url0}\n")
 
         while True:
             url = self._build_url(offset)
             try:
-                resp = self.session.get(url, timeout=20)
+                resp = self.session.get(url, timeout=25)
                 resp.raise_for_status()
             except requests.RequestException as e:
                 if offset == 0:
@@ -151,8 +237,24 @@ class FinvizScreener:
                 print(f"\n  Request stopped at offset {offset}: {e}")
                 break
 
+            if self._page_looks_blocked(resp.text):
+                print(
+                    "\n  Finviz returned a challenge/block page.\n"
+                    "  Try opening the URL in a browser to verify the results,\n"
+                    f"  then use --tickers to pass the list manually.\n"
+                    f"  URL: {url0}"
+                )
+                break
+
             page_tickers = self._parse_tickers(resp.text)
             if not page_tickers:
+                # First page with no tickers — could be genuine empty result
+                # or a layout change. Print a diagnostic snippet.
+                if offset == 0:
+                    snippet = resp.text[:500].replace("\n", " ")
+                    print(f"\n  [DEBUG] No tickers found on first page.")
+                    print(f"  HTTP status : {resp.status_code}")
+                    print(f"  HTML snippet: {snippet}\n")
                 break
 
             all_tickers.extend(page_tickers)
@@ -802,7 +904,16 @@ def main() -> None:
             universe = screener.screen()
         except Exception as exc:
             print(f"\nFinviz screening failed: {exc}")
-            print("Using fallback ticker list for demonstration.\n")
+            universe = []
+
+        if not universe:
+            print(
+                "\n  Finviz returned 0 results (blocked or no matches).\n"
+                "  Auto-switching to built-in fallback universe for demonstration.\n"
+                "  To use your own tickers: python stock_backtest.py --tickers AAPL MSFT ...\n"
+                f"  Finviz screener URL:\n"
+                f"    {FinvizScreener()._build_url()}\n"
+            )
             universe = FALLBACK_TICKERS
 
     if not universe:
